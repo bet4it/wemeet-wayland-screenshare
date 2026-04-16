@@ -136,6 +136,9 @@ void x11_sanitizer_main()
     fprintf(stderr, "%s", green_text("[x11_sanitizer] wayland session detected. skipping x11 sanitizer. \n").c_str());
     return;
   }
+
+  fprintf(stderr, "%s", yellow_text("[x11_sanitizer] preserving wemeet overlay windows.\n").c_str());
+  return;
   
   auto& interface_singleton = InterfaceSingleton::getSingleton();
   auto* interface_handle = interface_singleton.interface_handle.load();
@@ -302,6 +305,7 @@ void payload_main(){
   // screencast cancelled. we stop the gio mainloop and join the gio mainloop thread
   if (portal_handle->status.load() == XdpScreencastPortalStatus::kCancelled) {
     fprintf(stderr, "%s", red_text("[payload] screencast cancelled. stop gio and join gio thread. \n").c_str());
+    interface_singleton.interface_handle.load()->x11_sanitizer_stop_flag.store(true, std::memory_order_seq_cst);
     g_main_loop_quit(portal_handle->gio_mainloop);
     x11_sanitizer_thread.join();
     portal_gio_mainloop_thread.join();

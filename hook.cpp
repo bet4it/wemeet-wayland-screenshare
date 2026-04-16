@@ -40,9 +40,18 @@
 constexpr uint32_t DEFAULT_FRAME_HEIGHT = 1080;
 constexpr uint32_t DEFAULT_FRAME_WIDTH = 1920;
 
+// Delay portal startup until the first actual capture request in an attach cycle.
+static std::atomic<bool> g_lazy_portal_start_armed{false};
+// Once a share cycle is hooked, keep swallowing X11 fallback frames until detach.
+static std::atomic<bool> g_suppress_x11_fallback{false};
+
 void XShmAttachHook(){
 
   auto& interface_singleton = InterfaceSingleton::getSingleton();
+  if (interface_singleton.interface_handle.load() != nullptr ||
+      interface_singleton.portal_handle.load() != nullptr) {
+    return;
+  }
 
   // initialize interface singleton:
   // (1) allocate the interface object
@@ -71,7 +80,7 @@ void XShmAttachHook(){
   } else {
     // things are bad, we have to de-initialize and exit
     fprintf(stderr, "%s", red_text("[hook] portal status: " + payload_status_str + "\n").c_str());
-    fprintf(stderr, "%s", red_text("[hook] <<<!!Please DO NOT cancel screencast!!>> Hook is now exiting.\n").c_str());
+    fprintf(stderr, "%s", yellow_text("[hook] screencast was cancelled before start. cleaning up and allowing retry.\n").c_str());
     // payload thread should have quitted via g_main_loop_quit
     payload_thread.join();
     delete interface_singleton.interface_handle.load();
@@ -135,13 +144,15 @@ std::tuple<uint32_t, uint32_t, uint32_t, uint32_t> get_resize_param(
 }
 
 
-void XShmGetImageHook(XImage& image){
+bool XShmGetImageHook(XImage& image){
 
   auto& interface_singleton = InterfaceSingleton::getSingleton();
 
   if (interface_singleton.interface_handle.load() == nullptr){
-    fprintf(stderr, "%s", red_text("[hook] hook will NOT work as you have cancelled the screencast!!!\n").c_str());
-    return;
+    return false;
+  }
+  if (interface_singleton.pipewire_handle.load() == nullptr) {
+    return false;
   }
 
   auto ximage_spa_format = ximage_to_spa(image);
@@ -232,7 +243,7 @@ void XShmGetImageHook(XImage& image){
   // );
 
 
-  return;
+  return true;
   
 }
 
@@ -266,7 +277,8 @@ void XShmDetachHook(){
   
   // the interface_handle being non nullptr
   // means that the screencast has been started
-  if (interface_singleton.interface_handle != nullptr){
+  auto* interface_handle = interface_singleton.interface_handle.load();
+  if (interface_handle != nullptr){
 
     XShmDetachStopPWLoop();
     XShmDetachStopGIOLoop();
@@ -279,8 +291,10 @@ void XShmDetachHook(){
     delete interface_singleton.portal_handle.load();
     interface_singleton.portal_handle.store(nullptr);
     // (3) free the pipewire screencast object
-    delete interface_singleton.pipewire_handle.load();
-    interface_singleton.pipewire_handle.store(nullptr);
+    if (interface_singleton.pipewire_handle.load() != nullptr) {
+      delete interface_singleton.pipewire_handle.load();
+      interface_singleton.pipewire_handle.store(nullptr);
+    }
   } else {
     // we do nothing here since the objects (interface, portal) are already freed,
     // and pipewire object has never been created
@@ -293,16 +307,30 @@ void XShmDetachHook(){
 extern "C" {
 
 Bool XShmAttach(Display* dpy, XShmSegmentInfo* shminfo){
-  XShmAttachHook();
+  g_lazy_portal_start_armed.store(true, std::memory_order_seq_cst);
+  g_suppress_x11_fallback.store(true, std::memory_order_seq_cst);
   return XShmAttachFunc(dpy, shminfo);
 }
 
 Bool XShmGetImage(Display* dpy, Drawable d, XImage* image, int x, int y, unsigned long plane_mask){
-  XShmGetImageHook(*image);
-  return 1;
+  if (g_lazy_portal_start_armed.exchange(false, std::memory_order_seq_cst)) {
+    XShmAttachHook();
+  }
+
+  if (XShmGetImageHook(*image)) {
+    return 1;
+  }
+
+  if (g_suppress_x11_fallback.load(std::memory_order_seq_cst)) {
+    return 1;
+  }
+
+  return XShmGetImageFunc(dpy, d, image, x, y, plane_mask);
 }
 
 Bool XShmDetach(Display* dpy, XShmSegmentInfo* shminfo){
+  g_lazy_portal_start_armed.store(false, std::memory_order_seq_cst);
+  g_suppress_x11_fallback.store(false, std::memory_order_seq_cst);
   XShmDetachHook();
   return XShmDetachFunc(dpy, shminfo);
 }
